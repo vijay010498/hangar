@@ -1,9 +1,8 @@
 //! Shared types for Hangar: config loading and small helpers used across the
 //! daemon (`hangard`), the agent CLI (`hangar`), and the dashboard (`hangar-tui`).
-//!
-//! Slice 0 only needs config + a loopback check; the module grows per slice.
 
 pub mod config;
+pub mod router;
 
 /// True if `raw` is an HTTP(S) URL whose host is a loopback address or
 /// `localhost`. Used to enforce flight mode: in offline mode the daemon refuses

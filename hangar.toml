@@ -1,0 +1,27 @@
+# Hangar daemon config. Every field has a default; this file makes them explicit.
+
+[runtime]
+backend    = "ollama"
+offline    = true
+ollama_url = "http://127.0.0.1:11434"
+
+[server]
+host = "127.0.0.1"
+port = 11435
+
+[memory]
+ceiling_gb = 40                   # M5 Pro 48 GB, ~8 GB OS headroom
+warm_pool  = ["qwen3:1.7b"]       # pin the autocomplete model resident
+
+# Task class -> model. Pull these first: `ollama pull qwen3:1.7b qwen3:8b qwen3-coder:30b`.
+[routing.autocomplete]
+model = "qwen3:1.7b"
+[routing.chat]
+model = "qwen3:8b"
+[routing.agent]
+model = "qwen3-coder:30b"
+
+[agent]
+tools          = ["read_file", "edit_file", "bash", "grep", "glob"]
+confirm_before = ["edit_file", "bash"]
+auto_edit      = false
