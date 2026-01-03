@@ -13,23 +13,26 @@ use clap::Parser;
 use hangar_core::{
     config::HangarConfig,
     is_loopback_url,
+    memory::{Admission, MemoryManager, DEFAULT_MODEL_FOOTPRINT_BYTES},
     router::{self, Surface},
+    runtime::RuntimeClient,
 };
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::{
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use tracing::{error, info, warn};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const BYTES_PER_GB: f64 = 1024.0 * 1024.0 * 1024.0;
 
 #[derive(Parser)]
 #[command(
     name = "hangard",
     version,
-    about = "Hangar daemon - offline chat-completions proxy with task routing"
+    about = "Hangar daemon - offline chat-completions proxy with routing and memory management"
 )]
 struct Cli {
     #[arg(long, default_value = "hangar.toml")]
@@ -41,6 +44,11 @@ struct AppState {
     http: reqwest::Client,
     upstream: String,
     config: Arc<HangarConfig>,
+    runtime: Arc<RuntimeClient>,
+    mem: Arc<Mutex<MemoryManager>>,
+    // Serializes load/evict sequences so concurrent requests can never push the
+    // runtime past the ceiling. Resident models skip it via the fast path.
+    admission: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[tokio::main]
@@ -80,25 +88,43 @@ async fn main() -> Result<()> {
         warn!(host = %cfg.server.host, "binding to a non-loopback address with flight mode OFF");
     }
 
-    let addr = SocketAddr::new(bind_ip, cfg.server.port);
+    let ceiling_bytes = match cfg.memory.ceiling_gb {
+        Some(g) if g > 0.0 => (g * BYTES_PER_GB) as u64,
+        _ => {
+            warn!("no memory.ceiling_gb set - memory management disabled (no ceiling)");
+            u64::MAX
+        }
+    };
+
     let state = AppState {
         http: reqwest::Client::new(),
         upstream: upstream.clone(),
         config: cfg.clone(),
+        runtime: Arc::new(RuntimeClient::new(&upstream)),
+        mem: Arc::new(Mutex::new(MemoryManager::new(
+            ceiling_bytes,
+            &cfg.memory.warm_pool,
+        ))),
+        admission: Arc::new(tokio::sync::Mutex::new(())),
     };
 
     if probe_upstream(&state.http, &state.upstream).await {
         info!(upstream = %state.upstream, "runtime reachable");
+        preload_warm_pool(&state).await;
     } else {
         warn!(upstream = %state.upstream, "runtime NOT reachable yet - start it with `ollama serve`");
     }
 
+    spawn_reconcile_loop(&state);
+
+    let addr = SocketAddr::new(bind_ip, cfg.server.port);
     let app = Router::new()
         .route("/healthz", get(healthz))
+        .route("/admin/memory", get(mem_state))
         .route("/v1/models", get(passthrough))
         .route("/v1/chat/completions", post(chat))
         .route("/v1/completions", post(chat))
-        .with_state(state);
+        .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -108,7 +134,7 @@ async fn main() -> Result<()> {
         %addr,
         upstream = %upstream,
         offline = cfg.runtime.offline,
-        backend = %cfg.runtime.backend,
+        ceiling_gb = cfg.memory.ceiling_gb.unwrap_or(0.0),
         "hangard {VERSION} listening"
     );
 
@@ -118,11 +144,71 @@ async fn main() -> Result<()> {
         .context("server error")?;
 
     info!("hangard shutting down");
+    if state.config.memory.unload_on_exit {
+        unload_all(&state).await;
+    }
     Ok(())
 }
 
+// Unload everything resident, so models loaded with keep_alive = -1 don't stay
+// in the runtime after we exit.
+async fn unload_all(st: &AppState) {
+    let resident: Vec<String> = {
+        let m = st.mem.lock().unwrap();
+        m.snapshot()
+            .models
+            .into_iter()
+            .filter(|x| x.resident)
+            .map(|x| x.name)
+            .collect()
+    };
+    for model in resident {
+        info!(model = %model, "unloading on shutdown");
+        if let Err(e) = st.runtime.unload(&model).await {
+            warn!(model = %model, error = %e, "shutdown unload failed");
+        }
+    }
+}
+
+async fn preload_warm_pool(st: &AppState) {
+    for model in &st.config.memory.warm_pool {
+        info!(model = %model, "preloading warm-pool model");
+        if let Err(e) = st.runtime.load(model).await {
+            warn!(model = %model, error = %e, "warm-pool preload failed (is it pulled?)");
+        }
+    }
+    reconcile_now(st).await;
+}
+
+fn spawn_reconcile_loop(st: &AppState) {
+    let runtime = st.runtime.clone();
+    let mem = st.mem.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            ticker.tick().await;
+            if let Ok(ps) = runtime.ps().await {
+                let pairs: Vec<(String, u64)> =
+                    ps.into_iter().map(|m| (m.name, m.size_bytes)).collect();
+                if let Ok(mut m) = mem.lock() {
+                    m.reconcile(&pairs);
+                }
+            }
+        }
+    });
+}
+
+async fn reconcile_now(st: &AppState) {
+    if let Ok(ps) = st.runtime.ps().await {
+        let pairs: Vec<(String, u64)> = ps.into_iter().map(|m| (m.name, m.size_bytes)).collect();
+        if let Ok(mut m) = st.mem.lock() {
+            m.reconcile(&pairs);
+        }
+    }
+}
+
 async fn healthz(State(st): State<AppState>) -> impl IntoResponse {
-    Json(serde_json::json!({
+    Json(json!({
         "status": "ok",
         "service": "hangard",
         "version": VERSION,
@@ -130,7 +216,110 @@ async fn healthz(State(st): State<AppState>) -> impl IntoResponse {
     }))
 }
 
-// Classify the request, rewrite its `model` to the routed model, then proxy.
+async fn mem_state(State(st): State<AppState>) -> impl IntoResponse {
+    let snapshot = st.mem.lock().map(|m| m.snapshot()).ok();
+    Json(snapshot)
+}
+
+// Ensure `model` is resident within the ceiling before serving, evicting LRU
+// non-pinned models if needed. Returns an error Response to apply backpressure.
+#[allow(clippy::result_large_err)]
+async fn ensure_resident(st: &AppState, model: &str) -> Result<(), Response> {
+    if resident_touch(st, model) {
+        return Ok(());
+    }
+
+    let _permit = st.admission.lock().await;
+    // Another request may have loaded it while we waited for the permit.
+    if resident_touch(st, model) {
+        return Ok(());
+    }
+
+    let estimate = footprint_estimate(st, model).await;
+    let plan = st.mem.lock().unwrap().plan_admission(model, estimate);
+
+    match plan {
+        Admission::Serve => {
+            st.mem.lock().unwrap().touch(model);
+            Ok(())
+        }
+        Admission::CantFit => {
+            warn!(
+                model,
+                "cannot fit within memory ceiling - applying backpressure"
+            );
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": {
+                    "message": format!("model '{model}' does not fit within the memory ceiling"),
+                    "type": "memory_backpressure",
+                }})),
+            )
+                .into_response())
+        }
+        Admission::Load { victims } => {
+            for v in &victims {
+                info!(victim = %v, "evicting LRU model to make room");
+                if let Err(e) = st.runtime.unload(v).await {
+                    warn!(victim = %v, error = %e, "unload failed");
+                }
+                st.mem.lock().unwrap().mark_unloaded(v);
+            }
+            info!(model, "loading model");
+            if let Err(e) = st.runtime.load(model).await {
+                error!(model, error = %e, "load failed");
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error": {
+                        "message": format!("failed to load model '{model}': {e}"),
+                        "type": "model_load_failed",
+                    }})),
+                )
+                    .into_response());
+            }
+            reconcile_now(st).await;
+            // The real footprint (from /api/ps) may exceed the pre-load
+            // estimate; trim back under the ceiling if so, sparing the model
+            // we just loaded.
+            let overflow = st.mem.lock().unwrap().overflow_victims(model);
+            for v in &overflow {
+                info!(victim = %v, "evicting to restore ceiling after load");
+                if let Err(e) = st.runtime.unload(v).await {
+                    warn!(victim = %v, error = %e, "unload failed");
+                }
+                st.mem.lock().unwrap().mark_unloaded(v);
+            }
+            st.mem.lock().unwrap().touch(model);
+            Ok(())
+        }
+    }
+}
+
+// Footprint estimate for admission: learned resident size if known, else the
+// model's on-disk size from the runtime, else a conservative default.
+async fn footprint_estimate(st: &AppState, model: &str) -> u64 {
+    if let Some(f) = st.mem.lock().unwrap().learned_footprint(model) {
+        return f;
+    }
+    if let Ok(tags) = st.runtime.tags().await {
+        if let Some(found) = tags.iter().find(|m| m.name == model) {
+            return found.size_bytes;
+        }
+    }
+    DEFAULT_MODEL_FOOTPRINT_BYTES
+}
+
+fn resident_touch(st: &AppState, model: &str) -> bool {
+    let mut m = st.mem.lock().unwrap();
+    if m.is_resident(model) {
+        m.touch(model);
+        true
+    } else {
+        false
+    }
+}
+
+// Classify, ensure the routed model is resident, rewrite the body's model, proxy.
 async fn chat(
     State(st): State<AppState>,
     method: Method,
@@ -178,6 +367,10 @@ async fn chat(
         "routed"
     );
 
+    if let Err(resp) = ensure_resident(&st, &decision.model).await {
+        return resp;
+    }
+
     if let Some(obj) = body_json.as_object_mut() {
         obj.insert("model".to_string(), Value::String(decision.model));
     }
@@ -191,7 +384,7 @@ async fn chat(
     }
 }
 
-// Proxy without routing (e.g. GET /v1/models).
+// Proxy without routing or admission (e.g. GET /v1/models).
 async fn passthrough(
     State(st): State<AppState>,
     method: Method,
@@ -245,12 +438,10 @@ async fn forward(
             error!(error = %e, url = %url, "upstream request failed");
             (
                 StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({
-                    "error": {
-                        "message": format!("upstream request failed: {e}"),
-                        "type": "upstream_unreachable",
-                    }
-                })),
+                Json(json!({"error": {
+                    "message": format!("upstream request failed: {e}"),
+                    "type": "upstream_unreachable",
+                }})),
             )
                 .into_response()
         }
@@ -258,7 +449,7 @@ async fn forward(
 }
 
 // Rough token estimate from request text (chars / 4). Used only to decide tier
-// escalation; the real usage counts come back in the response.
+// escalation; real usage counts come back in the response.
 fn estimate_tokens(body_json: &Value, surface: Surface) -> usize {
     let chars = match surface {
         Surface::Completions => body_json

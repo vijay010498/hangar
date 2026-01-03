@@ -35,7 +35,11 @@ pub struct Decision {
     pub reason: String,
 }
 
-pub fn classify(surface: Surface, has_tools: bool, approx_tokens: usize) -> (TaskClass, &'static str) {
+pub fn classify(
+    surface: Surface,
+    has_tools: bool,
+    approx_tokens: usize,
+) -> (TaskClass, &'static str) {
     match surface {
         Surface::Completions => (
             TaskClass::Autocomplete,
@@ -141,7 +145,13 @@ mod tests {
 
     #[test]
     fn large_context_escalates_to_agent() {
-        let d = route(&cfg(), Surface::ChatCompletions, None, false, AGENT_TOKEN_THRESHOLD + 1);
+        let d = route(
+            &cfg(),
+            Surface::ChatCompletions,
+            None,
+            false,
+            AGENT_TOKEN_THRESHOLD + 1,
+        );
         assert_eq!(d.model, "big");
         assert_eq!(d.tier, "agent");
     }

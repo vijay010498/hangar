@@ -57,11 +57,25 @@ impl Default for ServerConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MemoryConfig {
     pub ceiling_gb: Option<f64>,
     pub warm_pool: Vec<String>,
+    /// Unload the models we loaded when the daemon stops. On by default because
+    /// we load with keep_alive = -1, so without this they would stay resident in
+    /// the runtime after hangard exits.
+    pub unload_on_exit: bool,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            ceiling_gb: None,
+            warm_pool: Vec::new(),
+            unload_on_exit: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

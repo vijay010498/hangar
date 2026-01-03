@@ -10,8 +10,8 @@ host = "127.0.0.1"
 port = 11435
 
 [memory]
-ceiling_gb = 40                   # M5 Pro 48 GB, ~8 GB OS headroom
-warm_pool  = ["qwen3:1.7b"]       # pin the autocomplete model resident
+ceiling_gb = 24
+warm_pool  = []       # pin the autocomplete model resident
 
 # Task class -> model. Pull these first: `ollama pull qwen3:1.7b qwen3:8b qwen3-coder:30b`.
 [routing.autocomplete]
