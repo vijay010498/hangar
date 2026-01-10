@@ -3,7 +3,7 @@
 //! pure (no I/O); the daemon pairs it with the
 //! runtime client to execute the load/unload decisions it returns.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 /// Estimate used for a model whose real footprint hasn't been observed yet.
@@ -31,7 +31,7 @@ pub struct MemoryManager {
     models: HashMap<String, Entry>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelView {
     pub name: String,
     pub footprint_bytes: u64,
@@ -40,7 +40,7 @@ pub struct ModelView {
     pub last_used: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemorySnapshot {
     pub ceiling_bytes: u64,
     pub resident_bytes: u64,

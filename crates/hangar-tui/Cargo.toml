@@ -1,0 +1,17 @@
+[package]
+name = "hangar-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hangar-tui"
+path = "src/main.rs"
+
+[dependencies]
+hangar-core.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+ratatui.workspace = true

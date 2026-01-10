@@ -11,6 +11,7 @@ use axum::{
 };
 use clap::Parser;
 use hangar_core::{
+    admin::{AdminState, FeedEvent},
     config::HangarConfig,
     is_loopback_url,
     memory::{Admission, MemoryManager, DEFAULT_MODEL_FOOTPRINT_BYTES},
@@ -19,8 +20,12 @@ use hangar_core::{
 };
 use serde_json::{json, Value};
 use std::{
+    collections::VecDeque,
     net::{IpAddr, SocketAddr},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 use tracing::{error, info, warn};
@@ -49,6 +54,8 @@ struct AppState {
     // Serializes load/evict sequences so concurrent requests can never push the
     // runtime past the ceiling. Resident models skip it via the fast path.
     admission: Arc<tokio::sync::Mutex<()>>,
+    feed: Arc<Mutex<VecDeque<FeedEvent>>>,
+    seq: Arc<AtomicU64>,
 }
 
 #[tokio::main]
@@ -106,6 +113,8 @@ async fn main() -> Result<()> {
             &cfg.memory.warm_pool,
         ))),
         admission: Arc::new(tokio::sync::Mutex::new(())),
+        feed: Arc::new(Mutex::new(VecDeque::new())),
+        seq: Arc::new(AtomicU64::new(0)),
     };
 
     if probe_upstream(&state.http, &state.upstream).await {
@@ -121,6 +130,7 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/admin/memory", get(mem_state))
+        .route("/admin/state", get(admin_state))
         .route("/v1/models", get(passthrough))
         .route("/v1/chat/completions", post(chat))
         .route("/v1/completions", post(chat))
@@ -173,6 +183,7 @@ async fn unload_all(st: &AppState) {
 async fn preload_warm_pool(st: &AppState) {
     for model in &st.config.memory.warm_pool {
         info!(model = %model, "preloading warm-pool model");
+        push_feed(st, "load", format!("{model} (warm pool)"));
         if let Err(e) = st.runtime.load(model).await {
             warn!(model = %model, error = %e, "warm-pool preload failed (is it pulled?)");
         }
@@ -221,6 +232,32 @@ async fn mem_state(State(st): State<AppState>) -> impl IntoResponse {
     Json(snapshot)
 }
 
+async fn admin_state(State(st): State<AppState>) -> impl IntoResponse {
+    let memory = st.mem.lock().unwrap().snapshot();
+    let feed = st
+        .feed
+        .lock()
+        .map(|f| f.iter().cloned().collect())
+        .unwrap_or_default();
+    Json(AdminState { memory, feed })
+}
+
+const FEED_CAP: usize = 200;
+
+fn push_feed(st: &AppState, kind: &str, message: String) {
+    let seq = st.seq.fetch_add(1, Ordering::Relaxed);
+    if let Ok(mut f) = st.feed.lock() {
+        f.push_back(FeedEvent {
+            seq,
+            kind: kind.to_string(),
+            message,
+        });
+        while f.len() > FEED_CAP {
+            f.pop_front();
+        }
+    }
+}
+
 // Ensure `model` is resident within the ceiling before serving, evicting LRU
 // non-pinned models if needed. Returns an error Response to apply backpressure.
 #[allow(clippy::result_large_err)]
@@ -248,6 +285,7 @@ async fn ensure_resident(st: &AppState, model: &str) -> Result<(), Response> {
                 model,
                 "cannot fit within memory ceiling - applying backpressure"
             );
+            push_feed(st, "backpressure", format!("{model} exceeds ceiling"));
             Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({"error": {
@@ -260,14 +298,17 @@ async fn ensure_resident(st: &AppState, model: &str) -> Result<(), Response> {
         Admission::Load { victims } => {
             for v in &victims {
                 info!(victim = %v, "evicting LRU model to make room");
+                push_feed(st, "evict", format!("{v} (LRU, to make room)"));
                 if let Err(e) = st.runtime.unload(v).await {
                     warn!(victim = %v, error = %e, "unload failed");
                 }
                 st.mem.lock().unwrap().mark_unloaded(v);
             }
             info!(model, "loading model");
+            push_feed(st, "load", model.to_string());
             if let Err(e) = st.runtime.load(model).await {
                 error!(model, error = %e, "load failed");
+                push_feed(st, "error", format!("load {model} failed"));
                 return Err((
                     StatusCode::BAD_GATEWAY,
                     Json(json!({"error": {
@@ -284,6 +325,7 @@ async fn ensure_resident(st: &AppState, model: &str) -> Result<(), Response> {
             let overflow = st.mem.lock().unwrap().overflow_victims(model);
             for v in &overflow {
                 info!(victim = %v, "evicting to restore ceiling after load");
+                push_feed(st, "evict", format!("{v} (overflow trim)"));
                 if let Err(e) = st.runtime.unload(v).await {
                     warn!(victim = %v, error = %e, "unload failed");
                 }
@@ -365,6 +407,11 @@ async fn chat(
         reason = %decision.reason,
         approx_tokens,
         "routed"
+    );
+    push_feed(
+        &st,
+        "routed",
+        format!("{} -> {}  ({})", decision.tier, decision.model, decision.reason),
     );
 
     if let Err(resp) = ensure_resident(&st, &decision.model).await {

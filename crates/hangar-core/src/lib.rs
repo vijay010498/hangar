@@ -1,6 +1,7 @@
 //! Shared types for Hangar: config loading and small helpers used across the
 //! daemon (`hangard`), the agent CLI (`hangar`), and the dashboard (`hangar-tui`).
 
+pub mod admin;
 pub mod config;
 pub mod memory;
 pub mod router;
