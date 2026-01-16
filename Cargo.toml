@@ -4,6 +4,7 @@ members = [
     "crates/hangar-core",
     "crates/hangard",
     "crates/hangar-tui",
+    "crates/hangar-cli",
 ]
 
 [workspace.package]
@@ -28,3 +29,9 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 ratatui = "0.29"
+async-stream = "0.3"
+futures-util = "0.3"
+similar = "2"
+regex = "1"
+walkdir = "2"
+glob = "0.3"

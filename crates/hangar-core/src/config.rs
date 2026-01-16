@@ -66,6 +66,7 @@ pub struct MemoryConfig {
     /// we load with keep_alive = -1, so without this they would stay resident in
     /// the runtime after hangard exits.
     pub unload_on_exit: bool,
+    pub idle_unload_minutes: u64,
 }
 
 impl Default for MemoryConfig {
@@ -74,6 +75,7 @@ impl Default for MemoryConfig {
             ceiling_gb: None,
             warm_pool: Vec::new(),
             unload_on_exit: true,
+            idle_unload_minutes: 30,
         }
     }
 }

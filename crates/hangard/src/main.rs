@@ -11,27 +11,36 @@ use axum::{
 };
 use clap::Parser;
 use hangar_core::{
-    admin::{AdminState, FeedEvent},
+    admin::{AdminState, FeedEvent, TokenUsage},
     config::HangarConfig,
     is_loopback_url,
     memory::{Admission, MemoryManager, DEFAULT_MODEL_FOOTPRINT_BYTES},
     router::{self, Surface},
     runtime::RuntimeClient,
 };
+use async_stream::stream;
+use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     net::{IpAddr, SocketAddr},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tracing::{error, info, warn};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const BYTES_PER_GB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+#[derive(Default)]
+struct TokenCounters {
+    input: AtomicU64,
+    output: AtomicU64,
+    requests: AtomicU64,
+}
 
 #[derive(Parser)]
 #[command(
@@ -56,6 +65,8 @@ struct AppState {
     admission: Arc<tokio::sync::Mutex<()>>,
     feed: Arc<Mutex<VecDeque<FeedEvent>>>,
     seq: Arc<AtomicU64>,
+    tokens: Arc<TokenCounters>,
+    last_seen: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 #[tokio::main]
@@ -115,6 +126,8 @@ async fn main() -> Result<()> {
         admission: Arc::new(tokio::sync::Mutex::new(())),
         feed: Arc::new(Mutex::new(VecDeque::new())),
         seq: Arc::new(AtomicU64::new(0)),
+        tokens: Arc::new(TokenCounters::default()),
+        last_seen: Arc::new(Mutex::new(HashMap::new())),
     };
 
     if probe_upstream(&state.http, &state.upstream).await {
@@ -131,7 +144,7 @@ async fn main() -> Result<()> {
         .route("/healthz", get(healthz))
         .route("/admin/memory", get(mem_state))
         .route("/admin/state", get(admin_state))
-        .route("/v1/models", get(passthrough))
+        .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat))
         .route("/v1/completions", post(chat))
         .with_state(state.clone());
@@ -194,15 +207,77 @@ async fn preload_warm_pool(st: &AppState) {
 fn spawn_reconcile_loop(st: &AppState) {
     let runtime = st.runtime.clone();
     let mem = st.mem.clone();
+    let admission = st.admission.clone();
+    let last_seen = st.last_seen.clone();
+    let feed = st.feed.clone();
+    let seq = st.seq.clone();
+    let idle_minutes = st.config.memory.idle_unload_minutes;
+
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_secs(5));
+        let mut ticker = tokio::time::interval(Duration::from_secs(15));
         loop {
             ticker.tick().await;
+
+            // Keep the manager's view in sync with the runtime.
             if let Ok(ps) = runtime.ps().await {
                 let pairs: Vec<(String, u64)> =
                     ps.into_iter().map(|m| (m.name, m.size_bytes)).collect();
                 if let Ok(mut m) = mem.lock() {
                     m.reconcile(&pairs);
+                }
+            }
+
+            // Unload non-pinned models idle past the threshold, freeing RAM. The
+            // next request reloads them on demand via ensure_resident.
+            if idle_minutes == 0 {
+                continue;
+            }
+            let threshold = Duration::from_secs(idle_minutes * 60);
+            let victims: Vec<String> = {
+                let snapshot = match mem.lock() {
+                    Ok(m) => m.snapshot(),
+                    Err(_) => continue,
+                };
+                let seen = last_seen.lock().ok();
+                snapshot
+                    .models
+                    .into_iter()
+                    .filter(|m| m.resident && !m.pinned)
+                    .filter(|m| {
+                        seen.as_ref()
+                            .and_then(|s| s.get(&m.name))
+                            .map(|t| t.elapsed() >= threshold)
+                            .unwrap_or(false)
+                    })
+                    .map(|m| m.name)
+                    .collect()
+            };
+            if victims.is_empty() {
+                continue;
+            }
+
+            let _permit = admission.lock().await;
+            for victim in victims {
+                let still_resident = mem.lock().map(|m| m.is_resident(&victim)).unwrap_or(false);
+                if !still_resident {
+                    continue;
+                }
+                info!(model = %victim, "idle unload");
+                if runtime.unload(&victim).await.is_ok() {
+                    if let Ok(mut m) = mem.lock() {
+                        m.mark_unloaded(&victim);
+                    }
+                    let s = seq.fetch_add(1, Ordering::Relaxed);
+                    if let Ok(mut f) = feed.lock() {
+                        f.push_back(FeedEvent {
+                            seq: s,
+                            kind: "evict".into(),
+                            message: format!("{victim} (idle {idle_minutes}m)"),
+                        });
+                        while f.len() > FEED_CAP {
+                            f.pop_front();
+                        }
+                    }
                 }
             }
         }
@@ -239,7 +314,16 @@ async fn admin_state(State(st): State<AppState>) -> impl IntoResponse {
         .lock()
         .map(|f| f.iter().cloned().collect())
         .unwrap_or_default();
-    Json(AdminState { memory, feed })
+    let tokens = TokenUsage {
+        input_tokens: st.tokens.input.load(Ordering::Relaxed),
+        output_tokens: st.tokens.output.load(Ordering::Relaxed),
+        requests: st.tokens.requests.load(Ordering::Relaxed),
+    };
+    Json(AdminState {
+        memory,
+        feed,
+        tokens,
+    })
 }
 
 const FEED_CAP: usize = 200;
@@ -278,6 +362,7 @@ async fn ensure_resident(st: &AppState, model: &str) -> Result<(), Response> {
     match plan {
         Admission::Serve => {
             st.mem.lock().unwrap().touch(model);
+            mark_seen(st, model);
             Ok(())
         }
         Admission::CantFit => {
@@ -332,6 +417,7 @@ async fn ensure_resident(st: &AppState, model: &str) -> Result<(), Response> {
                 st.mem.lock().unwrap().mark_unloaded(v);
             }
             st.mem.lock().unwrap().touch(model);
+            mark_seen(st, model);
             Ok(())
         }
     }
@@ -351,14 +437,26 @@ async fn footprint_estimate(st: &AppState, model: &str) -> u64 {
     DEFAULT_MODEL_FOOTPRINT_BYTES
 }
 
-fn resident_touch(st: &AppState, model: &str) -> bool {
-    let mut m = st.mem.lock().unwrap();
-    if m.is_resident(model) {
-        m.touch(model);
-        true
-    } else {
-        false
+fn mark_seen(st: &AppState, model: &str) {
+    if let Ok(mut seen) = st.last_seen.lock() {
+        seen.insert(model.to_string(), Instant::now());
     }
+}
+
+fn resident_touch(st: &AppState, model: &str) -> bool {
+    let resident = {
+        let mut m = st.mem.lock().unwrap();
+        if m.is_resident(model) {
+            m.touch(model);
+            true
+        } else {
+            false
+        }
+    };
+    if resident {
+        mark_seen(st, model);
+    }
+    resident
 }
 
 // Classify, ensure the routed model is resident, rewrite the body's model, proxy.
@@ -379,7 +477,7 @@ async fn chat(
 
     let Ok(mut body_json) = serde_json::from_slice::<Value>(&body) else {
         warn!("request body is not JSON; forwarding unrouted");
-        return forward(&st, method, path_q, &headers, body).await;
+        return forward(&st, method, path_q, &headers, body, true).await;
     };
 
     let requested = body_json
@@ -423,37 +521,53 @@ async fn chat(
     }
 
     match serde_json::to_vec(&body_json) {
-        Ok(routed) => forward(&st, method, path_q, &headers, routed.into()).await,
+        Ok(routed) => forward(&st, method, path_q, &headers, routed.into(), true).await,
         Err(e) => {
             error!(error = %e, "re-serializing routed body failed; forwarding original");
-            forward(&st, method, path_q, &headers, body).await
+            forward(&st, method, path_q, &headers, body, true).await
         }
     }
 }
 
-// Proxy without routing or admission (e.g. GET /v1/models).
-async fn passthrough(
-    State(st): State<AppState>,
-    method: Method,
-    OriginalUri(uri): OriginalUri,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    let path_q = uri
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or_else(|| uri.path());
-    forward(&st, method, path_q, &headers, body).await
+async fn list_models(State(st): State<AppState>) -> impl IntoResponse {
+    let mut data: Vec<Value> = st
+        .config
+        .routing
+        .keys()
+        .map(|tier| {
+            json!({
+                "id": tier,
+                "object": "model",
+                "created": 0,
+                "owned_by": "hangar",
+            })
+        })
+        .collect();
+
+    if let Ok(models) = st.runtime.tags().await {
+        for m in models {
+            data.push(json!({
+                "id": m.name,
+                "object": "model",
+                "created": 0,
+                "owned_by": "library",
+            }));
+        }
+    }
+
+    Json(json!({ "object": "list", "data": data }))
 }
 
 // Send the request upstream and stream the response straight back, so SSE token
-// streaming is preserved unchanged.
+// streaming is preserved. When `meter` is set, the body is also observed as it
+// streams (never buffered off the wire) to accumulate token usage at the end.
 async fn forward(
     st: &AppState,
     method: Method,
     path_q: &str,
     headers: &HeaderMap,
     body: Bytes,
+    meter: bool,
 ) -> Response {
     let url = format!("{}{}", st.upstream, path_q);
     let mut req = st.http.request(method, &url);
@@ -470,16 +584,38 @@ async fn forward(
         Ok(resp) => {
             let status =
                 StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            let ct = resp.headers().get(reqwest::header::CONTENT_TYPE).cloned();
+
+            let response_body = if meter {
+                let tokens = st.tokens.clone();
+                let upstream = resp.bytes_stream();
+                Body::from_stream(stream! {
+                    let mut upstream = upstream;
+                    let mut buf: Vec<u8> = Vec::new();
+                    while let Some(item) = upstream.next().await {
+                        if let Ok(ref chunk) = item {
+                            buf.extend_from_slice(chunk);
+                        }
+                        yield item;
+                    }
+                    if let Some((input, output)) = parse_usage(&buf) {
+                        tokens.input.fetch_add(input, Ordering::Relaxed);
+                        tokens.output.fetch_add(output, Ordering::Relaxed);
+                        tokens.requests.fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+            } else {
+                Body::from_stream(resp.bytes_stream())
+            };
+
             let mut builder = Response::builder().status(status);
-            if let Some(ct) = resp.headers().get(reqwest::header::CONTENT_TYPE) {
+            if let Some(ct) = ct {
                 builder = builder.header(header::CONTENT_TYPE, ct.as_bytes());
             }
-            builder
-                .body(Body::from_stream(resp.bytes_stream()))
-                .unwrap_or_else(|e| {
-                    error!(error = %e, "failed to build proxied response");
-                    StatusCode::BAD_GATEWAY.into_response()
-                })
+            builder.body(response_body).unwrap_or_else(|e| {
+                error!(error = %e, "failed to build proxied response");
+                StatusCode::BAD_GATEWAY.into_response()
+            })
         }
         Err(e) => {
             error!(error = %e, url = %url, "upstream request failed");
@@ -492,6 +628,46 @@ async fn forward(
             )
                 .into_response()
         }
+    }
+}
+
+// Pull prompt/completion token counts from a chat response body. Non-streaming
+// bodies are one JSON object with `usage`; streamed SSE bodies carry it in a
+// final `data:` chunk (only when the client requested usage).
+fn parse_usage(buf: &[u8]) -> Option<(u64, u64)> {
+    if let Ok(v) = serde_json::from_slice::<Value>(buf) {
+        if let Some(u) = v.get("usage") {
+            return extract_usage(u);
+        }
+    }
+    let text = std::str::from_utf8(buf).ok()?;
+    let mut last = None;
+    for line in text.lines() {
+        if let Some(rest) = line.trim_start().strip_prefix("data:") {
+            let rest = rest.trim();
+            if rest == "[DONE]" {
+                continue;
+            }
+            if let Ok(v) = serde_json::from_str::<Value>(rest) {
+                if let Some(pair) = v.get("usage").and_then(extract_usage) {
+                    last = Some(pair);
+                }
+            }
+        }
+    }
+    last
+}
+
+fn extract_usage(u: &Value) -> Option<(u64, u64)> {
+    let input = u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
+    let output = u
+        .get("completion_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if input == 0 && output == 0 {
+        None
+    } else {
+        Some((input, output))
     }
 }
 

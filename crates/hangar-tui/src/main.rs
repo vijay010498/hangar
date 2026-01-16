@@ -15,7 +15,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Gauge, List, ListItem, Row, Table},
+    widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Row, Table},
     Frame, Terminal,
 };
 use std::{
@@ -33,12 +33,18 @@ struct Cli {
     url: String,
 }
 
-type Shared = Arc<Mutex<Option<AdminState>>>;
+#[derive(Default, Clone)]
+struct UiState {
+    admin: Option<AdminState>,
+    out_per_sec: u64,
+}
+
+type Shared = Arc<Mutex<UiState>>;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let shared: Shared = Arc::new(Mutex::new(None));
+    let shared: Shared = Arc::new(Mutex::new(UiState::default()));
 
     // Background poller - keeps `shared` fresh without blocking the UI.
     {
@@ -47,16 +53,27 @@ async fn main() -> Result<()> {
         let client = reqwest::Client::new();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(1));
+            let mut prev_out = 0u64;
             loop {
                 ticker.tick().await;
-                // On any failure drop to None so the UI shows "connecting"
-                // rather than stale data; it reconnects on the next tick.
-                let state = match client.get(&url).send().await {
+                // On any failure drop to None so the UI shows "waiting for
+                // hangard" rather than stale data; it reconnects next tick.
+                let admin = match client.get(&url).send().await {
                     Ok(resp) => resp.json::<AdminState>().await.ok(),
                     Err(_) => None,
                 };
+                // Polls are 1s apart, so the output-token delta is ~tokens/sec.
+                let out_per_sec = match &admin {
+                    Some(a) => {
+                        let now = a.tokens.output_tokens;
+                        let rate = now.saturating_sub(prev_out);
+                        prev_out = now;
+                        rate
+                    }
+                    None => 0,
+                };
                 if let Ok(mut s) = shared.lock() {
-                    *s = state;
+                    *s = UiState { admin, out_per_sec };
                 }
             }
         });
@@ -77,8 +94,8 @@ async fn main() -> Result<()> {
 
 fn run<B: Backend>(terminal: &mut Terminal<B>, shared: &Shared, url: &str) -> Result<()> {
     loop {
-        let snapshot = shared.lock().ok().and_then(|s| s.clone());
-        terminal.draw(|f| draw(f, snapshot.as_ref(), url))?;
+        let ui = shared.lock().ok().map(|s| s.clone()).unwrap_or_default();
+        terminal.draw(|f| draw(f, &ui, url))?;
 
         if event::poll(Duration::from_millis(250))? {
             if let Event::Key(key) = event::read()? {
@@ -95,19 +112,41 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, shared: &Shared, url: &str) -> Re
     }
 }
 
-fn draw(f: &mut Frame, state: Option<&AdminState>, url: &str) {
+fn draw(f: &mut Frame, ui: &UiState, url: &str) {
+    let state = ui.admin.as_ref();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
+            Constraint::Length(1),
             Constraint::Min(6),
             Constraint::Length(10),
         ])
         .split(f.area());
 
     draw_gauge(f, chunks[0], state, url);
-    draw_models(f, chunks[1], state);
-    draw_feed(f, chunks[2], state);
+    draw_stats(f, chunks[1], state, ui.out_per_sec);
+    draw_models(f, chunks[2], state);
+    draw_feed(f, chunks[3], state);
+}
+
+fn draw_stats(
+    f: &mut Frame,
+    area: ratatui::layout::Rect,
+    state: Option<&AdminState>,
+    out_per_sec: u64,
+) {
+    let line = match state {
+        Some(s) => format!(
+            "  tokens   in {}   out {}   |   {} tok/s   |   {} requests",
+            s.tokens.input_tokens, s.tokens.output_tokens, out_per_sec, s.tokens.requests
+        ),
+        None => "  tokens   -".to_string(),
+    };
+    f.render_widget(
+        Paragraph::new(line).style(Style::default().fg(Color::Gray)),
+        area,
+    );
 }
 
 fn draw_gauge(f: &mut Frame, area: ratatui::layout::Rect, state: Option<&AdminState>, url: &str) {

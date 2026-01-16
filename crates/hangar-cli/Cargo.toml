@@ -1,0 +1,21 @@
+[package]
+name = "hangar-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hangar"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+similar.workspace = true
+regex.workspace = true
+walkdir.workspace = true
+glob.workspace = true

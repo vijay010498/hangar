@@ -10,8 +10,17 @@ pub struct FeedEvent {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub requests: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminState {
     pub memory: MemorySnapshot,
     pub feed: Vec<FeedEvent>,
+    #[serde(default)]
+    pub tokens: TokenUsage,
 }
