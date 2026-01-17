@@ -11,3 +11,4 @@ Cargo.lock.orig
 # Local runtime state
 *.sock
 *.log
+.hangar/
