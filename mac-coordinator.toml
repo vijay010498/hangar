@@ -1,0 +1,25 @@
+# Mac, process 1 of 2: the coordinator. Does no local inference. It maps
+# tier -> concrete model, picks a worker that can serve that model, and
+# forwards the request. Clients (WebStorm, the CLI) point HERE.
+[runtime]
+backend    = "ollama"
+offline    = false                       # LAN mode: allow binding off-loopback
+ollama_url = "http://127.0.0.1:11434"    # unused for serving; required field
+
+[server]
+host = "0.0.0.0"                          # listen on the LAN, not just loopback
+port = 11436
+
+[memory]
+ceiling_gb = 24                           # coordinator's own view; serving happens on workers
+
+# Tier -> model map. The coordinator owns this; workers just serve what they are told.
+[routing.autocomplete]
+model = "qwen3:1.7b"
+[routing.chat]
+model = "qwen3:8b"
+[routing.agent]
+model = "qwen3-coder:30b"
+
+[cluster]
+role = "coordinator"

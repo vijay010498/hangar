@@ -23,4 +23,6 @@ pub struct AdminState {
     pub feed: Vec<FeedEvent>,
     #[serde(default)]
     pub tokens: TokenUsage,
+    #[serde(default)]
+    pub nodes: Vec<crate::cluster::NodeView>,
 }

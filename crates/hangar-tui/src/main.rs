@@ -126,7 +126,11 @@ fn draw(f: &mut Frame, ui: &UiState, url: &str) {
 
     draw_gauge(f, chunks[0], state, url);
     draw_stats(f, chunks[1], state, ui.out_per_sec);
-    draw_models(f, chunks[2], state);
+    if state.map(|s| !s.nodes.is_empty()).unwrap_or(false) {
+        draw_fleet(f, chunks[2], state);
+    } else {
+        draw_models(f, chunks[2], state);
+    }
     draw_feed(f, chunks[3], state);
 }
 
@@ -150,9 +154,25 @@ fn draw_stats(
 }
 
 fn draw_gauge(f: &mut Frame, area: ratatui::layout::Rect, state: Option<&AdminState>, url: &str) {
-    let (resident, ceiling) = state
-        .map(|s| (s.memory.resident_bytes, s.memory.ceiling_bytes))
-        .unwrap_or((0, 0));
+    let (resident, ceiling) = match state {
+        Some(s) if !s.nodes.is_empty() => {
+            let r: u64 = s
+                .nodes
+                .iter()
+                .filter(|n| n.online)
+                .map(|n| n.memory.resident_bytes)
+                .sum();
+            let c: u64 = s
+                .nodes
+                .iter()
+                .filter(|n| n.online && n.memory.ceiling_bytes != u64::MAX)
+                .map(|n| n.memory.ceiling_bytes)
+                .sum();
+            (r, c)
+        }
+        Some(s) => (s.memory.resident_bytes, s.memory.ceiling_bytes),
+        None => (0, 0),
+    };
     let unbounded = ceiling == 0 || ceiling == u64::MAX;
     let ratio = if unbounded {
         0.0
@@ -264,6 +284,65 @@ fn draw_feed(f: &mut Frame, area: ratatui::layout::Rect, state: Option<&AdminSta
             .title(" Routing / eviction feed   (q to quit) "),
     );
     f.render_widget(feed, area);
+}
+
+fn draw_fleet(f: &mut Frame, area: ratatui::layout::Rect, state: Option<&AdminState>) {
+    let mut rows: Vec<Row> = Vec::new();
+    if let Some(s) = state {
+        for n in &s.nodes {
+            let status = if n.online { "●" } else { "○" };
+            let resident_count = n.memory.models.iter().filter(|m| m.resident).count();
+            let node_style = if n.online {
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            rows.push(
+                Row::new(vec![
+                    status.to_string(),
+                    n.name.clone(),
+                    format!("{} / {}", gb(n.memory.resident_bytes), gb(n.memory.ceiling_bytes)),
+                    format!("{resident_count} resident"),
+                ])
+                .style(node_style),
+            );
+
+            for m in n.memory.models.iter().filter(|m| m.resident) {
+                let pin = if m.pinned { " (pin)" } else { "" };
+                rows.push(
+                    Row::new(vec![
+                        String::new(),
+                        format!("  {}{}", m.name, pin),
+                        gb(m.footprint_bytes),
+                        format!("lru {}", m.last_used),
+                    ])
+                    .style(Style::default().fg(Color::Gray)),
+                );
+            }
+        }
+    }
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(3),
+            Constraint::Min(22),
+            Constraint::Length(18),
+            Constraint::Min(14),
+        ],
+    )
+    .header(
+        Row::new(vec!["", "node / model", "memory / footprint", "detail"])
+            .style(Style::default().add_modifier(Modifier::BOLD)),
+    )
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Fleet  (● online  ○ offline) "),
+    );
+    f.render_widget(table, area);
 }
 
 fn gb(bytes: u64) -> String {

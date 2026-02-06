@@ -1,0 +1,23 @@
+[runtime]
+backend    = "ollama"
+offline    = false
+ollama_url = "http://127.0.0.1:11434"    # Ollama for Windows, running locally
+
+[server]
+host = "0.0.0.0"
+port = 11435
+
+[memory]
+ceiling_gb = 7                            # 8 GB GPU: hold ~7 GB, leave room for Windows/display
+warm_pool  = []
+
+[routing.autocomplete]
+model = "qwen3:1.7b"
+[routing.chat]
+model = "qwen3:8b"
+
+[cluster]
+role            = "worker"
+coordinator_url = "http://192.168.2.18:11436"
+node_name       = "alienware"
+advertise_url   = "http://ALIENWARE_IP:11435"

@@ -2,6 +2,7 @@
 //! daemon (`hangard`), the agent CLI (`hangar`), and the dashboard (`hangar-tui`).
 
 pub mod admin;
+pub mod cluster;
 pub mod config;
 pub mod memory;
 pub mod router;

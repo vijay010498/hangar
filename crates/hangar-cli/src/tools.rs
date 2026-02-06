@@ -118,15 +118,34 @@ fn func(name: &str, description: &str, parameters: Value) -> Value {
 
 /// Execute a tool call. Always returns a string to feed back to the model -
 /// errors are returned as text so the model can see them and retry.
+// A single tool result must never dominate the model's context window. Results
+// larger than this are truncated with a note, so one grep or read cannot blow
+// up the conversation (and trip the daemon's body limit).
+const MAX_TOOL_OUTPUT: usize = 60000;
+
 pub fn execute(name: &str, args: &Value, gate: &mut Gate) -> String {
-    match name {
+    let out = match name {
         "read_file" => read_file(args),
         "edit_file" => edit_file(args, gate),
         "bash" => bash(args, gate),
         "grep" => grep(args),
         "glob" => glob_tool(args),
         other => format!("error: unknown tool '{other}'"),
+    };
+    clamp_output(out)
+}
+
+fn clamp_output(mut out: String) -> String {
+    if out.len() <= MAX_TOOL_OUTPUT {
+        return out;
     }
+    let mut end = MAX_TOOL_OUTPUT;
+    while !out.is_char_boundary(end) {
+        end -= 1;
+    }
+    out.truncate(end);
+    out.push_str("\n... (output truncated - narrow the query or read a specific range)");
+    out
 }
 
 fn read_file(args: &Value) -> String {
@@ -250,7 +269,16 @@ fn grep(args: &Value) -> String {
         if let Ok(content) = std::fs::read_to_string(entry.path()) {
             for (i, line) in content.lines().enumerate() {
                 if re.is_match(line) {
-                    out.push_str(&format!("{}:{}: {}\n", entry.path().display(), i + 1, line));
+                    let shown = if line.len() > 300 {
+                        let mut end = 300;
+                        while !line.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        format!("{}... (line truncated)", &line[..end])
+                    } else {
+                        line.to_string()
+                    };
+                    out.push_str(&format!("{}:{}: {}\n", entry.path().display(), i + 1, shown));
                     count += 1;
                     if count >= 200 {
                         out.push_str("... (truncated at 200 matches)\n");

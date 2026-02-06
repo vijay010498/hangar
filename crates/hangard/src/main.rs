@@ -3,7 +3,7 @@
 use anyhow::{bail, Context, Result};
 use axum::{
     body::{Body, Bytes},
-    extract::{OriginalUri, State},
+    extract::{DefaultBodyLimit, OriginalUri, State},
     http::{header, HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -12,6 +12,7 @@ use axum::{
 use clap::Parser;
 use hangar_core::{
     admin::{AdminState, FeedEvent, TokenUsage},
+    cluster::{ClusterRegistry, Heartbeat},
     config::HangarConfig,
     is_loopback_url,
     memory::{Admission, MemoryManager, DEFAULT_MODEL_FOOTPRINT_BYTES},
@@ -28,7 +29,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tracing::{error, info, warn};
 
@@ -40,6 +41,28 @@ struct TokenCounters {
     input: AtomicU64,
     output: AtomicU64,
     requests: AtomicU64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    Standalone,
+    Worker,
+    Coordinator,
+}
+
+fn parse_role(s: &str) -> Role {
+    match s.trim().to_lowercase().as_str() {
+        "coordinator" => Role::Coordinator,
+        "worker" => Role::Worker,
+        _ => Role::Standalone,
+    }
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 #[derive(Parser)]
@@ -67,6 +90,8 @@ struct AppState {
     seq: Arc<AtomicU64>,
     tokens: Arc<TokenCounters>,
     last_seen: Arc<Mutex<HashMap<String, Instant>>>,
+    role: Role,
+    registry: Arc<Mutex<ClusterRegistry>>,
 }
 
 #[tokio::main]
@@ -128,6 +153,8 @@ async fn main() -> Result<()> {
         seq: Arc::new(AtomicU64::new(0)),
         tokens: Arc::new(TokenCounters::default()),
         last_seen: Arc::new(Mutex::new(HashMap::new())),
+        role: parse_role(&cfg.cluster.role),
+        registry: Arc::new(Mutex::new(ClusterRegistry::default())),
     };
 
     if probe_upstream(&state.http, &state.upstream).await {
@@ -138,6 +165,13 @@ async fn main() -> Result<()> {
     }
 
     spawn_reconcile_loop(&state);
+    spawn_heartbeat(&state);
+    spawn_prune(&state);
+    match state.role {
+        Role::Coordinator => info!("cluster role: coordinator"),
+        Role::Worker => info!(coordinator = %cfg.cluster.coordinator_url, "cluster role: worker"),
+        Role::Standalone => {}
+    }
 
     let addr = SocketAddr::new(bind_ip, cfg.server.port);
     let app = Router::new()
@@ -147,6 +181,8 @@ async fn main() -> Result<()> {
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat))
         .route("/v1/completions", post(chat))
+        .route("/cluster/heartbeat", post(cluster_heartbeat))
+        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind(addr)
@@ -319,10 +355,20 @@ async fn admin_state(State(st): State<AppState>) -> impl IntoResponse {
         output_tokens: st.tokens.output.load(Ordering::Relaxed),
         requests: st.tokens.requests.load(Ordering::Relaxed),
     };
+    let nodes = if st.role == Role::Coordinator {
+        let now = now_secs();
+        st.registry
+            .lock()
+            .map(|r| r.views(now, st.config.cluster.node_timeout_secs))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     Json(AdminState {
         memory,
         feed,
         tokens,
+        nodes,
     })
 }
 
@@ -477,7 +523,10 @@ async fn chat(
 
     let Ok(mut body_json) = serde_json::from_slice::<Value>(&body) else {
         warn!("request body is not JSON; forwarding unrouted");
-        return forward(&st, method, path_q, &headers, body, true).await;
+        return match target_url(&st, "", path_q) {
+            Some(url) => forward(&st, method, url, &headers, body, true).await,
+            None => no_host_response("unknown"),
+        };
     };
 
     let requested = body_json
@@ -512,19 +561,30 @@ async fn chat(
         format!("{} -> {}  ({})", decision.tier, decision.model, decision.reason),
     );
 
-    if let Err(resp) = ensure_resident(&st, &decision.model).await {
-        return resp;
-    }
+    let url = if st.role == Role::Coordinator {
+        match target_url(&st, &decision.model, path_q) {
+            Some(u) => {
+                push_feed(&st, "route-host", u.clone());
+                u
+            }
+            None => return no_host_response(&decision.model),
+        }
+    } else {
+        if let Err(resp) = ensure_resident(&st, &decision.model).await {
+            return resp;
+        }
+        format!("{}{}", st.upstream, path_q)
+    };
 
     if let Some(obj) = body_json.as_object_mut() {
         obj.insert("model".to_string(), Value::String(decision.model));
     }
 
     match serde_json::to_vec(&body_json) {
-        Ok(routed) => forward(&st, method, path_q, &headers, routed.into(), true).await,
+        Ok(routed) => forward(&st, method, url, &headers, routed.into(), true).await,
         Err(e) => {
             error!(error = %e, "re-serializing routed body failed; forwarding original");
-            forward(&st, method, path_q, &headers, body, true).await
+            forward(&st, method, url, &headers, body, true).await
         }
     }
 }
@@ -564,12 +624,11 @@ async fn list_models(State(st): State<AppState>) -> impl IntoResponse {
 async fn forward(
     st: &AppState,
     method: Method,
-    path_q: &str,
+    url: String,
     headers: &HeaderMap,
     body: Bytes,
     meter: bool,
 ) -> Response {
-    let url = format!("{}{}", st.upstream, path_q);
     let mut req = st.http.request(method, &url);
     for name in [header::CONTENT_TYPE, header::ACCEPT] {
         if let Some(v) = headers.get(&name) {
@@ -706,4 +765,114 @@ async fn probe_upstream(client: &reqwest::Client, base: &str) -> bool {
 
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
+}
+
+fn target_url(st: &AppState, model: &str, path_q: &str) -> Option<String> {
+    if st.role == Role::Coordinator {
+        let host = {
+            let now = now_secs();
+            st.registry
+                .lock()
+                .ok()?
+                .select_host(model, now, st.config.cluster.node_timeout_secs)?
+        };
+        Some(format!("{}{}", host.trim_end_matches('/'), path_q))
+    } else {
+        Some(format!("{}{}", st.upstream, path_q))
+    }
+}
+
+fn no_host_response(model: &str) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({"error": {
+            "message": format!("no cluster node available to serve '{model}'"),
+            "type": "no_host_available",
+        }})),
+    )
+        .into_response()
+}
+
+async fn cluster_heartbeat(State(st): State<AppState>, Json(hb): Json<Heartbeat>) -> StatusCode {
+    if let Ok(mut r) = st.registry.lock() {
+        r.upsert(hb, now_secs());
+    }
+    StatusCode::OK
+}
+
+fn spawn_heartbeat(st: &AppState) {
+    if st.role != Role::Worker {
+        return;
+    }
+    let coordinator = st
+        .config
+        .cluster
+        .coordinator_url
+        .trim_end_matches('/')
+        .to_string();
+    let advertise = st.config.cluster.advertise_url.clone();
+    let name = st.config.cluster.node_name.clone();
+    if coordinator.is_empty() || advertise.is_empty() || name.is_empty() {
+        warn!("worker role set but cluster.coordinator_url / advertise_url / node_name is empty - not heartbeating");
+        return;
+    }
+
+    let http = st.http.clone();
+    let mem = st.mem.clone();
+    let secs = st.config.cluster.heartbeat_secs.max(1);
+    let serves: Vec<String> = st
+        .config
+        .routing
+        .values()
+        .map(|p| p.model.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    tokio::spawn(async move {
+        let endpoint = format!("{coordinator}/cluster/heartbeat");
+        let mut ticker = tokio::time::interval(Duration::from_secs(secs));
+        loop {
+            ticker.tick().await;
+            let memory = match mem.lock() {
+                Ok(m) => m.snapshot(),
+                Err(_) => continue,
+            };
+            let hb = Heartbeat {
+                name: name.clone(),
+                url: advertise.clone(),
+                serves: serves.clone(),
+                memory,
+            };
+            match http.post(&endpoint).json(&hb).send().await {
+                Ok(_) => info!(
+                    coordinator = %coordinator,
+                    resident = hb.memory.resident_bytes,
+                    "heartbeat sent"
+                ),
+                Err(e) => warn!(error = %e, "heartbeat to coordinator failed"),
+            }
+        }
+    });
+}
+
+fn spawn_prune(st: &AppState) {
+    if st.role != Role::Coordinator {
+        return;
+    }
+    let registry = st.registry.clone();
+    let drop_after = st
+        .config
+        .cluster
+        .node_timeout_secs
+        .saturating_mul(4)
+        .max(60);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(10));
+        loop {
+            ticker.tick().await;
+            if let Ok(mut r) = registry.lock() {
+                r.prune(now_secs(), drop_after);
+            }
+        }
+    });
 }

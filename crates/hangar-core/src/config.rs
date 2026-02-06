@@ -11,6 +11,7 @@ pub struct HangarConfig {
     pub memory: MemoryConfig,
     pub routing: BTreeMap<String, RouteProfile>,
     pub agent: AgentConfig,
+    pub cluster: ClusterConfig,
 }
 
 impl HangarConfig {
@@ -19,6 +20,30 @@ impl HangarConfig {
             Ok(s) => Ok(toml::from_str(&s)?),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e.into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClusterConfig {
+    pub role: String,
+    pub coordinator_url: String,
+    pub node_name: String,
+    pub advertise_url: String,
+    pub heartbeat_secs: u64,
+    pub node_timeout_secs: u64,
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            role: "standalone".into(),
+            coordinator_url: String::new(),
+            node_name: String::new(),
+            advertise_url: String::new(),
+            heartbeat_secs: 5,
+            node_timeout_secs: 20,
         }
     }
 }

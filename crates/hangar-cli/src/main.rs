@@ -379,6 +379,28 @@ fn handle_slash(cmd: &str, messages: &mut Vec<Message>, session_id: &mut Option<
     false
 }
 
+// qwen3-family models wrap their chain-of-thought in <think>...</think>. Drop
+// those spans so the user sees the answer, not the reasoning. An unterminated
+// <think> (response cut short) drops everything from the tag onward.
+fn strip_think(text: &str) -> (String, bool) {
+    let mut out = String::new();
+    let mut rest = text;
+    let mut had = false;
+    while let Some(start) = rest.find("<think>") {
+        out.push_str(&rest[..start]);
+        had = true;
+        match rest[start..].find("</think>") {
+            Some(end) => rest = &rest[start + end + "</think>".len()..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    (out.trim().to_string(), had)
+}
+
 async fn run_turn(
     client: &reqwest::Client,
     endpoint: &str,
@@ -424,11 +446,15 @@ async fn run_turn(
             }
         }
 
-        if let Some(text) = msg.content.as_ref() {
-            let text = text.trim();
-            if !text.is_empty() {
-                println!("{text}");
+        if let Some(text) = msg.content.take() {
+            let (visible, had_think) = strip_think(&text);
+            if had_think {
+                println!("{DIM}(thinking...){RESET}");
             }
+            if !visible.is_empty() {
+                println!("{visible}");
+            }
+            msg.content = (!visible.is_empty()).then_some(visible);
         }
 
         let calls = msg.tool_calls.clone();
